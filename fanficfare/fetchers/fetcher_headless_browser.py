@@ -31,6 +31,14 @@ profile.  Each process keeps one tab open while it's fetching and
 closes it after IDLE_SECONDS or at exit.  The browser is closed when
 no tab with a DevTools client attached is left, which also ignores
 the startup tab and tabs of FFF processes that died.
+
+When the headless browser can't pass a challenge (eg, Cloudflare's
+checkbox), the page is opened in a visible browser window, with a
+second profile, for the user to solve it
+(headless_browser_challenge_window).  The site's cookies, including
+Cloudflare's clearance, are then copied to the headless browser and
+the window is closed.  If the headless browser is challenged again
+anyway, the visible window is used for the rest of the session.
 '''
 
 import atexit
@@ -52,9 +60,18 @@ logger = logging.getLogger(__name__)
 
 IDLE_SECONDS = 60
 LAUNCH_TIMEOUT = 30
+## Cloudflare's automatic challenges pass in a few seconds; one still
+## there after this long needs a person.
+HEADLESS_CHALLENGE_SECONDS = 20
+## a headless challenge this soon after copying the cookies from the
+## visible browser means they didn't work.
+RECHALLENGE_SECONDS = 600
 ## Chrome's exit code when it hands its command line to a browser
 ## already running with the same profile.
 EXIT_PROCESS_NOTIFIED = 21
+
+class ChallengeNotPassed(exceptions.HTTPErrorFFF):
+    pass
 
 class HeadlessBrowserFetcher(Fetcher):
     def __init__(self,getConfig_fn,getConfigList_fn):
@@ -71,24 +88,61 @@ class HeadlessBrowserFetcher(Fetcher):
                      # error_msg through to the user.
                 "use_headless_browser can only make GET requests, not %s"%method)
         logger.debug(make_log('HeadlessBrowserFetcher',method,url,hit='REQ',bar='-'))
-        timeout = 60.0
+        browser_path = find_browser(self.getConfig('headless_browser_path'))
+        profile_dir = self.getConfig('headless_browser_profile_path') or default_profile_dir()
+        headless = get_browser(browser_path,profile_dir,headless=True)
+        visible = None
+        if self.getConfig('headless_browser_challenge_window',True):
+            visible = get_browser(browser_path,profile_dir+'-visible',headless=False)
+        return fetch_page(headless,
+                          visible,
+                          url,
+                          (headers or {}).get('Referer'),
+                          self.get_seconds('headless_browser_timeout',60.0),
+                          self.get_seconds('headless_browser_challenge_timeout',300.0))
+
+    def get_seconds(self,key,default):
         try:
-            timeout = float(self.getConfig('headless_browser_timeout',timeout))
+            return float(self.getConfig(key,default))
         except Exception as e:
-            logger.error("headless_browser_timeout setting failed: %s -- Using default value(%s)"%(e,timeout))
-        browser = get_browser(find_browser(self.getConfig('headless_browser_path')),
-                              self.getConfig('headless_browser_profile_path') or default_profile_dir())
-        return browser.fetch(url,(headers or {}).get('Referer'),timeout)
+            logger.error("%s setting failed: %s -- Using default value(%s)"%(key,e,default))
+            return default
+
+def fetch_page(headless,visible,url,referer,timeout,challenge_timeout):
+    '''
+    Fetch with the headless browser, falling back to the visible one
+    (if not None) for a challenge the headless browser can't pass.
+    '''
+    if visible is not None and visible.keep_visible:
+        return visible.fetch(url,referer,challenge_timeout)
+    try:
+        return headless.fetch(url,referer,timeout)
+    except ChallengeNotPassed:
+        if visible is None:
+            raise
+    logger.warning("Challenge the headless browser can't pass, opening it in a browser window: "
+                   "solve it there within %s seconds (see headless_browser_challenge_timeout)."%challenge_timeout)
+    fetchresp = visible.fetch(url,referer,challenge_timeout)
+    if time.time() - visible.cookies_copied < RECHALLENGE_SECONDS:
+        ## headless was challenged again soon after getting the
+        ## cookies, they don't work for it.
+        logger.warning("Headless browser still challenged, using the browser window until it's idle.")
+        visible.keep_visible = True
+    else:
+        headless.set_cookies(visible.get_cookies(fetchresp.redirecturl))
+        visible.cookies_copied = time.time()
+        visible.close()
+    return fetchresp
 
 _browsers = {}
 _browsers_lock = threading.Lock()
 
-def get_browser(browser_path,profile_dir):
-    '''One HeadlessBrowser per browser/profile in this process.'''
-    key = (browser_path, os.path.realpath(profile_dir))
+def get_browser(browser_path,profile_dir,headless=True):
+    '''One ManagedBrowser per browser/profile in this process.'''
+    key = (browser_path, os.path.realpath(profile_dir), headless)
     with _browsers_lock:
         if key not in _browsers:
-            _browsers[key] = HeadlessBrowser(*key)
+            _browsers[key] = ManagedBrowser(*key)
             atexit.register(_browsers[key].close)
         return _browsers[key]
 
@@ -125,11 +179,13 @@ def default_profile_dir():
     base = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
     return os.path.join(base,'fanficfare','headless-browser')
 
-class HeadlessBrowser(object):
+class ManagedBrowser(object):
     '''This process's connection and tab in the profile's shared browser.'''
-    def __init__(self,browser_path,profile_dir):
+    def __init__(self,browser_path,profile_dir,headless=True):
         self.browser_path = browser_path
         self.profile_dir = profile_dir
+        self.headless = headless
+        self.label = 'Headless browser' if headless else 'Visible browser'
         self.lock = threading.RLock()
         self.proc = None # only if launched by this process
         self.conn = None
@@ -137,6 +193,9 @@ class HeadlessBrowser(object):
         self.session_id = None
         self.idle_timer = None
         self.last_used = 0
+        ## visible challenge window state, see fetch_page()
+        self.keep_visible = False
+        self.cookies_copied = 0
 
     def fetch(self,url,referer,timeout):
         with self.lock:
@@ -151,10 +210,10 @@ class HeadlessBrowser(object):
                         return self.navigate(url,referer,timeout)
                     except (CDPError,OSError) as e:
                         ## browser closed or crashed since the last request.
-                        logger.warning("Headless browser connection failed(%s), attempt %s"%(e,attempt))
+                        logger.warning("Browser connection failed(%s), attempt %s"%(e,attempt))
                         self.drop()
                         if attempt == 2:
-                            raise exceptions.HTTPErrorFFF(url,428,"Headless browser failed: %s"%e)
+                            raise exceptions.HTTPErrorFFF(url,428,"%s failed: %s"%(self.label,e))
             finally:
                 self.last_used = time.time()
                 self.start_idle_timer()
@@ -183,14 +242,15 @@ class HeadlessBrowser(object):
     def launch(self,stale_url):
         os.makedirs(self.profile_dir,exist_ok=True)
         args = [self.browser_path,
-                '--headless',
                 '--remote-debugging-port=0',
                 '--user-data-dir='+self.profile_dir,
                 '--no-first-run',
                 '--no-default-browser-check',
                 '--disable-blink-features=AutomationControlled',
                 'about:blank']
-        logger.debug("Launching headless browser: %s"%args)
+        if self.headless:
+            args.insert(1,'--headless')
+        logger.debug("Launching browser: %s"%args)
         proc = subprocess.Popen(args,
                                 stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL,
@@ -203,20 +263,30 @@ class HeadlessBrowser(object):
             if url and (url != stale_url or code is not None):
                 try:
                     self.conn = CDPConnection(url)
-                    logger.debug("Launched headless browser at %s"%url)
+                    logger.debug("Launched browser at %s"%url)
                     if code is None:
                         self.proc = proc
+                        if not self.headless:
+                            ## use the window's startup tab rather
+                            ## than show a second one.
+                            tabs = [ t for t in self.conn.call('Target.getTargets')['targetInfos']
+                                     if t['type'] == 'page' ]
+                            if len(tabs) == 1:
+                                self.target_id = tabs[0]['targetId']
                     return
                 except (CDPError,OSError) as e:
-                    logger.debug("Headless browser not ready at %s(%s)"%(url,e))
+                    logger.debug("%s not ready at %s(%s)"%(self.label,url,e))
             if code is not None and code != EXIT_PROCESS_NOTIFIED:
-                raise exceptions.FailedToDownload("Headless browser(%s) exited with code %s"%(self.browser_path,code))
+                raise exceptions.FailedToDownload("%s(%s) exited with code %s"%(self.label,self.browser_path,code))
             time.sleep(0.2)
-        raise exceptions.FailedToDownload("Headless browser(%s) did not start in %s seconds"%(self.browser_path,LAUNCH_TIMEOUT))
+        raise exceptions.FailedToDownload("%s(%s) did not start in %s seconds"%(self.label,self.browser_path,LAUNCH_TIMEOUT))
 
-    def attached_tabs(self):
+    def other_attached_tabs(self):
+        '''Tabs of other FFF processes using this browser.'''
+        ## not ours: after Target.closeTarget returns, the closed tab
+        ## is usually still listed as attached for a moment.
         return [ t for t in self.conn.call('Target.getTargets')['targetInfos']
-                 if t['type'] == 'page' and t['attached'] ]
+                 if t['type'] == 'page' and t['attached'] and t['targetId'] != self.target_id ]
 
     def open_tab(self):
         if self.target_id is None:
@@ -230,6 +300,22 @@ class HeadlessBrowser(object):
         self.conn.call('Network.setUserAgentOverride',{'userAgent':user_agent},self.session_id)
         self.conn.call('Network.enable',{},self.session_id)
         self.conn.call('Page.enable',{},self.session_id)
+        if not self.headless:
+            self.conn.call('Page.bringToFront',{},self.session_id)
+
+    def get_cookies(self,url):
+        with self.lock:
+            return self.conn.call('Network.getCookies',{'urls':[url]},self.session_id)['cookies']
+
+    def set_cookies(self,cookies):
+        with self.lock:
+            if self.conn is None:
+                self.connect()
+            if self.session_id is None:
+                self.open_tab()
+            self.conn.call('Network.setCookies',
+                           {'cookies':[ cookie_param(c) for c in cookies ]},
+                           self.session_id)
 
     def navigate(self,url,referer,timeout):
         conn = self.conn
@@ -250,7 +336,7 @@ class HeadlessBrowser(object):
         except CDPCommandError as e:
             ## eg, invalid URL.  Other CDPErrors are connection
             ## problems, retried by fetch().
-            raise exceptions.HTTPErrorFFF(url,428,"Headless browser: %s"%e)
+            raise exceptions.HTTPErrorFFF(url,428,"%s: %s"%(self.label,e))
         if result.get('errorText'):
             ## Chrome shows its own error page, eg for a 404 with an
             ## empty body.  Report the HTTP status if there was one.
@@ -261,12 +347,16 @@ class HeadlessBrowser(object):
                     event_params.get('loaderId') == result.get('loaderId') and
                     event_params.get('type') == 'Document' ):
                     status = event_params['response']['status']
-            raise exceptions.HTTPErrorFFF(url,status,"Headless browser: %s"%result['errorText'])
-        document = wait_for_document(conn,session_id,result['frameId'],result['loaderId'],deadline)
+            raise exceptions.HTTPErrorFFF(url,status,"%s: %s"%(self.label,result['errorText']))
+        ## a person solves challenges in the visible browser.
+        challenge_seconds = HEADLESS_CHALLENGE_SECONDS if self.headless else timeout
+        document = wait_for_document(conn,session_id,result['frameId'],result['loaderId'],
+                                     deadline,challenge_seconds)
         if document is None:
-            raise exceptions.HTTPErrorFFF(url,428,"Headless browser: no page after %s seconds"%timeout)
+            raise exceptions.HTTPErrorFFF(url,428,"%s: no page after %s seconds"%(self.label,timeout))
         if is_challenge(document['response']):
-            raise exceptions.HTTPErrorFFF(url,428,"Headless browser didn't pass the Cloudflare challenge in %s seconds (see headless_browser_timeout)"%timeout)
+            raise ChallengeNotPassed(url,428,"%s didn't pass the Cloudflare challenge in %s seconds"%(
+                    self.label,challenge_seconds))
         response = document['response']
         body = conn.call('Network.getResponseBody',{'requestId':document['requestId']},session_id)
         if body['base64Encoded']:
@@ -292,18 +382,24 @@ class HeadlessBrowser(object):
         '''Close this process's tab, and the browser if no other FFF process has one.'''
         with self.lock:
             self.cancel_idle_timer()
+            self.keep_visible = False
             if self.conn is None:
                 return
             try:
                 if self.target_id:
                     self.conn.call('Target.closeTarget',{'targetId':self.target_id})
-                if not self.attached_tabs():
-                    logger.debug("Closing headless browser")
+                others = self.other_attached_tabs()
+                if others:
+                    ## another process may be closing its tab too.
+                    time.sleep(0.5)
+                    others = self.other_attached_tabs()
+                if not others:
+                    logger.debug("Closing browser(%s)"%self.profile_dir)
                     self.conn.call('Browser.close')
                     if self.proc is not None:
                         self.proc.wait(10)
             except (CDPError,OSError,subprocess.TimeoutExpired) as e:
-                logger.debug("Headless browser close failed: %s"%e)
+                logger.debug("%s close failed: %s"%(self.label,e))
             self.drop()
 
     def drop(self):
@@ -327,13 +423,13 @@ class HeadlessBrowser(object):
             self.idle_timer.cancel()
             self.idle_timer = None
 
-def wait_for_document(conn,session_id,frame_id,loader_id,deadline):
+def wait_for_document(conn,session_id,frame_id,loader_id,deadline,challenge_seconds):
     '''
     Return the Network.responseReceived params of the page's final
     document once it has loaded.  Cloudflare challenge documents are
     skipped while they run, until their page replaces them (a new
-    navigation, with its own loaderId); if that doesn't happen by the
-    deadline, the challenge is returned.
+    navigation, with its own loaderId); if that doesn't happen within
+    challenge_seconds (or by the deadline), the challenge is returned.
     '''
     document = None
     challenge = None
@@ -354,15 +450,28 @@ def wait_for_document(conn,session_id,frame_id,loader_id,deadline):
         elif method == 'Network.loadingFinished':
             if not is_challenge(document['response']):
                 return document
-            logger.debug("Waiting for Cloudflare challenge in headless browser")
+            if challenge is None:
+                logger.debug("Waiting for Cloudflare challenge, up to %s seconds"%challenge_seconds)
+                deadline = min(deadline,time.time()+challenge_seconds)
             challenge = document
             document = None
         elif method == 'Network.loadingFailed':
             if not params.get('canceled'):
                 raise exceptions.HTTPErrorFFF(document['response']['url'],428,
-                                              "Headless browser: %s"%params.get('errorText'))
+                                              "Browser: %s"%params.get('errorText'))
             ## replaced by another navigation before it finished.
             document = None
+
+## Network.Cookie fields that Network.setCookies accepts back.
+COOKIE_PARAM_FIELDS = ('name','value','domain','path','secure','httpOnly',
+                       'sameSite','priority','sourceScheme','sourcePort','partitionKey')
+
+def cookie_param(cookie):
+    '''Network.getCookies result to a Network.setCookies CookieParam.'''
+    param = dict( (k, cookie[k]) for k in COOKIE_PARAM_FIELDS if k in cookie )
+    if not cookie.get('session'):
+        param['expires'] = cookie['expires']
+    return param
 
 def is_challenge(response):
     ## Cloudflare marks its challenge pages, eg fanfiction.net's.

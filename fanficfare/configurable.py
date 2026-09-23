@@ -212,6 +212,7 @@ def get_valid_set_options():
                'use_browser_cache_only':(None,None,boollist),
                'open_pages_in_browser':(None,None,boollist),
                'use_headless_browser':(None,None,boollist),
+               'headless_browser_challenge_window':(None,None,boollist),
 
                'continue_on_chapter_error':(None,None,boollist),
                'conditionals_use_lists':(None,None,boollist),
@@ -403,6 +404,7 @@ def get_valid_keywords():
                  'force_img_self_referer_regexp',
                  'force_login',
                  'generate_cover_settings',
+                 'headless_browser_challenge_timeout',
                  'headless_browser_path',
                  'headless_browser_profile_path',
                  'headless_browser_timeout',
