@@ -34,6 +34,7 @@ from . import exceptions
 from . import fetchers
 from .fetchers import fetcher_nsapa_proxy
 from .fetchers import fetcher_flaresolverr_proxy
+from .fetchers import fetcher_headless_browser
 
 ## has to be up here for brotli-dict to load correctly.
 from .browsercache import BrowserCache
@@ -210,6 +211,7 @@ def get_valid_set_options():
                'use_browser_cache':(None,None,boollist+['directimages']),
                'use_browser_cache_only':(None,None,boollist),
                'open_pages_in_browser':(None,None,boollist),
+               'use_headless_browser':(None,None,boollist),
 
                'continue_on_chapter_error':(None,None,boollist),
                'conditionals_use_lists':(None,None,boollist),
@@ -401,6 +403,9 @@ def get_valid_keywords():
                  'force_img_self_referer_regexp',
                  'force_login',
                  'generate_cover_settings',
+                 'headless_browser_path',
+                 'headless_browser_profile_path',
+                 'headless_browser_timeout',
                  'http_proxy',
                  'https_proxy',
                  'ignore_chapter_url_list',
@@ -1022,7 +1027,10 @@ class Configuration(ConfigParser):
             # save and re-apply cookiejar when make_new.
         if not self.fetcher or make_new:
 
-            if self.getConfig('use_flaresolverr_proxy',False):
+            if self.getConfig('use_headless_browser',False):
+                logger.debug("use_headless_browser:%s"%self.getConfig('use_headless_browser'))
+                fetchcls = fetcher_headless_browser.HeadlessBrowserFetcher
+            elif self.getConfig('use_flaresolverr_proxy',False):
                 logger.debug("use_flaresolverr_proxy:%s"%self.getConfig('use_flaresolverr_proxy'))
                 fetchcls = fetcher_flaresolverr_proxy.FlareSolverr_ProxyFetcher
                 if (self.getConfig('include_images') and

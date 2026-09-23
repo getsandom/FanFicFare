@@ -60,11 +60,16 @@ class BrowserCacheDecorator(FetcherDecorator):
             fromcache=True
 
             open_pages_in_browser_tries_limit = int(fetcher.getConfig("open_pages_in_browser_tries_limit",6))
+            ## pages not in the cache go to the headless browser
+            ## fetcher instead of open_pages_in_browser, even with
+            ## use_browser_cache_only.
+            use_headless_browser = fetcher.getConfig("use_headless_browser")
 
             # if usecache: # Ignore usecache flag--it's for BasicCache.
             try:
                 parsedUrl = urlparse(url)
-                if domain_open_tries.get(parsedUrl.netloc,0) >= open_pages_in_browser_tries_limit:
+                if( not use_headless_browser and
+                    domain_open_tries.get(parsedUrl.netloc,0) >= open_pages_in_browser_tries_limit ):
                     raise exceptions.HTTPErrorFFF(
                         url,
                         428, # 404 & 410 trip StoryDoesNotExist
@@ -80,6 +85,7 @@ class BrowserCacheDecorator(FetcherDecorator):
                 # logger.debug("domain_open_tries:%s:"%domain_open_tries)
                 while( fetcher.getConfig("use_browser_cache_only") and
                        fetcher.getConfig("open_pages_in_browser",False) and
+                       not use_headless_browser and
                        parsedUrl.scheme != 'file' and
                        not d and open_tries
                        and domain_open_tries.get(parsedUrl.netloc,0) < open_pages_in_browser_tries_limit ):
@@ -120,7 +126,9 @@ class BrowserCacheDecorator(FetcherDecorator):
                 logger.debug("fromcache:%s"%fromcache)
                 return FetcherResponse(d,redirecturl=url,fromcache=fromcache)
 
-            if fetcher.getConfig("use_browser_cache_only") and parsedUrl.scheme != 'file':
+            if( fetcher.getConfig("use_browser_cache_only") and
+                parsedUrl.scheme != 'file' and
+                not use_headless_browser ):
                 raise exceptions.HTTPErrorFFF(
                     url,
                     428, # 404 & 410 trip StoryDoesNotExist
