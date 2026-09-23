@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 INDEX_MAGIC_NUMBER = 0xC103CAC3
 BLOCK_MAGIC_NUMBER = 0xC104CAC3
 
+## from chromium's net/http/http_response_info.cc
+RESPONSE_INFO_VERSION = 3
+RESPONSE_INFO_VERSION_MASK = 0xFF
+RESPONSE_INFO_HAS_EXTRA_FLAGS = 1 << 31
+
 class BlockfileCache(BaseChromiumCache):
     """Class to access data stream in Chrome Disk Blockfile Cache format cache files"""
 
@@ -134,10 +139,23 @@ class BlockfileCache(BaseChromiumCache):
                 rawdata = None if location else self.get_raw_data(entry)
                 return (
                     location,
-                    self.make_age(entry.creationTime),
+                    self.make_age(self.get_response_time(entry)),
                     ensure_text(entry.httpHeader.headers.get(b'content-encoding','')),
                     rawdata)
         return None
+
+    def get_response_time(self,entry):
+        """
+        The browser updates an entry in place when it fetches the page
+        again, so creationTime can be much older than the data.  Use
+        response_time from the saved HttpResponseInfo instead, like
+        SimpleCache does.
+        """
+        try:
+            return _read_response_time(entry.httpHeader.data())
+        except Exception as e:
+            logger.debug("Failed to read response_time, using creationTime: %s"%e)
+            return entry.creationTime
 
     def get_raw_data(self,entry):
         for i in range(len(entry.data)):
@@ -149,4 +167,20 @@ class BlockfileCache(BaseChromiumCache):
                 # logger.debug("type = UNKNOWN, data len:%s"%len(data))
                 # logger.debug("entry.httpHeader:%s"%entry.httpHeader)
                 return data
+
+
+def _read_response_time(data):
+    """
+    Return response_time from a pickled HttpResponseInfo (stream 0):
+      uint32 pickle payload size, uint32 flags,
+      uint32 extra_flags (only if flags & RESPONSE_INFO_HAS_EXTRA_FLAGS),
+      uint64 request_time, uint64 response_time, ...
+    Times are microseconds since 1601, same as creationTime.
+    """
+    flags = struct.unpack_from('<L', data, 4)[0]
+    if flags & RESPONSE_INFO_VERSION_MASK != RESPONSE_INFO_VERSION:
+        raise ValueError("Unexpected HttpResponseInfo version %s"%(flags & RESPONSE_INFO_VERSION_MASK))
+    offset = 12 if flags & RESPONSE_INFO_HAS_EXTRA_FLAGS else 8
+    (request_time, response_time) = struct.unpack_from('<QQ', data, offset)
+    return response_time
 

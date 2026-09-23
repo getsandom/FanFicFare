@@ -39,7 +39,12 @@ class BaseChromiumCache(BaseBrowserCache):
     # 1/0/_dk_chrome-extension://akiljllkbielkidmammnifcnibaigelm chrome-extension://akiljllkbielkidmammnifcnibaigelm https://www.fanfiction.net/s/14161667/10/That-Time-I-Was-Reincarnated-In-Brockton-Bay
     def make_keys(self,url):
         (scheme, domains, url) = self.make_key_parts(url)
-        return [ '1/0/_dk_'+scheme+'://'+d+' '+scheme+'://'+d+' '+url for d in domains ] + \
+        ## Pages opened from outside the browser (open_pages_in_browser)
+        ## or from a same-site link are keyed '_dk_'.  Pages reached by
+        ## following a link on another site (search results, forums)
+        ## are keyed '_dk_cn_', see kCrossSiteMainFrameNavigationPrefix
+        ## in chromium's net/http/http_cache.cc
+        return [ '1/0/_dk_'+cn+scheme+'://'+d+' '+scheme+'://'+d+' '+url for d in domains for cn in ('','cn_') ] + \
             [ '1/0/_dk_chrome-extension://akiljllkbielkidmammnifcnibaigelm chrome-extension://akiljllkbielkidmammnifcnibaigelm '+url ]
 
     def make_age(self,response_time):
