@@ -42,6 +42,13 @@ def get_fff_config(url,fileform="epub",personalini=None,ini_snippet=None):
 def get_fff_adapter(url,fileform="epub",personalini=None,ini_snippet=None):
     return adapters.getAdapter(get_fff_config(url,fileform,personalini,ini_snippet),url)
 
+## Add New with Background Metadata: the background first pass job
+## and the foreground pass after it both use FFF's page cache, so the
+## foreground pass reads the pages the job fetched.  Put first so it
+## lands in [overrides] whatever sections the snippet itself has.
+def first_pass_ini_snippet(ini_snippet):
+    return "use_basic_cache:true\n" + (ini_snippet or "")
+
 def test_config(initext):
     try:
         configini = get_fff_config("test1.com?sid=555",

@@ -426,17 +426,20 @@ class AddNewDialog(HotKeyedSizePersistedDialog, INISnippetDialog):
 
         self.gbl.addLayout(horz)
 
-        ## bgmeta not used with Add New because of stories that change
-        ## story URL and for title/author collision matching.
-        # horz = QHBoxLayout()
-        # self.bgmeta = QCheckBox(_('Background Metadata?'),self)
-        # self.bgmeta.setToolTip(_("Collect Metadata from sites in a Background process.<br />This returns control to you quicker while updating, but you won't be asked for username/passwords or if you are an adult--stories that need those will just fail."))
-        # self.bgmeta.setChecked(self.prefs['bgmeta'])
-        # horz.addWidget(self.bgmeta)
-        # self.mergehide.append(self.bgmeta)
-        # self.mergeupdateshow.append(self.bgmeta)
+        ## bgmeta (skipping the metadata fetch) isn't used with Add New
+        ## because of stories that change story URL and for
+        ## title/author collision matching.  Instead, Background
+        ## Metadata here fetches the metadata in a job first and then
+        ## runs the usual checks on the job's pages, see
+        ## dispatch_first_pass_job() in fff_plugin.
+        horz = QHBoxLayout()
+        self.bgmeta = QCheckBox(_('Background Metadata?'),self)
+        self.bgmeta.setToolTip(_("Collect Metadata from sites in a Background process.<br />Calibre stays usable meanwhile; when it's done, the stories are checked against your library and any questions (reject list, existing books, username/password, adult) are asked."))
+        self.bgmeta.setChecked(self.prefs['bgmeta'])
+        horz.addWidget(self.bgmeta)
+        self.mergehide.append(self.bgmeta)
 
-        # self.gbl.addLayout(horz)
+        self.gbl.addLayout(horz)
 
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.button_box.accepted.connect(self.ok_clicked)
@@ -555,7 +558,7 @@ class AddNewDialog(HotKeyedSizePersistedDialog, INISnippetDialog):
             self.collision.setCurrentIndex(i)
 
         self.updatemeta.setChecked(self.prefs['updatemeta'])
-        # self.bgmeta.setChecked(self.prefs['bgmeta'])
+        self.bgmeta.setChecked(self.prefs['bgmeta'])
 
         self.url.setText(url_list_text)
         if url_list_text:
@@ -597,7 +600,8 @@ class AddNewDialog(HotKeyedSizePersistedDialog, INISnippetDialog):
                 'fileform': str(self.fileform.currentText()),
                 'collision': str(self.collision.currentText()),
                 'updatemeta': self.updatemeta.isChecked(),
-                'bgmeta': False, # self.bgmeta.isChecked(),
+                'bgmeta': False, # see self.bgmeta above
+                'bg_first_pass': self.bgmeta.isChecked() and not self.merge,
                 'smarten_punctuation':self.prefs['smarten_punctuation'],
                 'do_wordcount':self.prefs['do_wordcount'],
                 'ini_snippet':self.get_ini_snippet_text(),

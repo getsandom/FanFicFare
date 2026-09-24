@@ -27,6 +27,57 @@ except NameError:
 #
 # ------------------------------------------------------------------------------
 
+def do_first_pass_worker(book_list,
+                         options,
+                         notification=lambda x,y:x):
+    '''
+    Background first pass for Add New with Background Metadata: fetch
+    each story's metadata with the page cache on, then save the cache
+    and cookies for the foreground pass, which reads the pages from it
+    instead of the sites.  Stories that need a username/password or
+    adult check are left for the foreground pass to ask about.
+    '''
+    from calibre_plugins.fanficfare_plugin import FanFicFareBase
+    fffbase = FanFicFareBase(options['plugin_path'])
+    with fffbase:
+        from calibre_plugins.fanficfare_plugin.fff_util import (get_fff_config,
+                                                               first_pass_ini_snippet)
+        from fanficfare import adapters, exceptions
+
+        good_list = [ x for x in book_list if x['good'] ]
+        basic_cache = cookiejar = None
+        for (count, book) in enumerate(good_list):
+            notification(float(count)/len(good_list),
+                         _('Fetched metadata for %(count)d of %(total)d stories')%{'count':count,'total':len(good_list)})
+            try:
+                configuration = get_fff_config(book['url'],
+                                               options['fileform'],
+                                               options['personal.ini'],
+                                               ini_snippet=first_pass_ini_snippet(options.get('ini_snippet',None)))
+                adapter = adapters.getAdapter(configuration,book['url'])
+                adapter.setChaptersRange(book['begin'],book['end'])
+                ## one page cache and cookiejar for all, as in the
+                ## foreground pass.
+                if basic_cache is None:
+                    basic_cache = configuration.get_basic_cache()
+                    cookiejar = configuration.get_cookiejar()
+                else:
+                    configuration.set_basic_cache(basic_cache)
+                    configuration.set_cookiejar(cookiejar)
+                adapter.getStoryMetadataOnly(get_cover=False)
+            except (exceptions.FailedToLogin,
+                    exceptions.NeedTimedOneTimePassword,
+                    exceptions.AdultCheckRequired) as e:
+                logger.info("%s needs %s, left for the foreground pass"%(book['url'],e.__class__.__name__))
+            except Exception as e:
+                logger.info("Fetching metadata for %s failed: %s"%(book['url'],e))
+                book['first_pass_error'] = str(e)
+
+        if basic_cache is not None:
+            basic_cache.save_cache(options['first_pass_cachefile'])
+            cookiejar.save_cookiejar(options['first_pass_cookiejarfile'])
+        return book_list
+
 def do_download_worker_single(site,
                               book_list,
                               options,

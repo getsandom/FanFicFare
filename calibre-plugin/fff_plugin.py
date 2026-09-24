@@ -70,7 +70,7 @@ from fanficfare.fff_profile import do_cprofile
 
 from calibre_plugins.fanficfare_plugin.fff_util import (
     get_fff_adapter, get_fff_config, get_fff_personalini,
-    get_common_elements)
+    get_common_elements, first_pass_ini_snippet)
 
 from calibre_plugins.fanficfare_plugin.config import (
     permitted_values, rejecturllist, STD_COLS_SKIP)
@@ -1200,11 +1200,24 @@ class FanFicFarePlugin(InterfaceAction):
             options['tdir']=tdir
 
         if any(x['good'] for x in books):
+            if( options.get('bg_first_pass') and
+                not options.get('first_pass_done') and
+                not merge and
+                options['collision'] != CALIBREONLYSAVECOL ):
+                ## Add New with Background Metadata: fetch in a job
+                ## first; first_pass_completed() comes back here.
+                self.dispatch_first_pass_job(books, options)
+                return
             if options['bgmeta']:
                 status_bar=_('Start queuing downloading for %s stories.')%len(books)
                 init_label=_("Queuing download for stories...")
                 win_title=_("Queuing download for stories")
                 status_prefix=_("Queued download for")
+            elif options.get('first_pass_done'):
+                status_bar=_('Checking %s stories fetched in the background.')%len(books)
+                init_label=_("Checking stories...")
+                win_title=_("Checking stories")
+                status_prefix=_("Checked")
             else:
                 status_bar=_('Started fetching metadata for %s stories.')%len(books)
                 init_label=_("Fetching metadata for stories...")
@@ -1225,6 +1238,50 @@ class FanFicFarePlugin(InterfaceAction):
         # prep_download_loop updates book object for each with metadata from site,
         # LoopProgressDialog calls start_download_job at the end which goes
         # into the BG, or shows list if no 'good' books.
+
+    def dispatch_first_pass_job(self, book_list, options):
+        '''
+        Add New with Background Metadata: fetch the stories' metadata
+        in a calibre job first, then run the usual foreground pass on
+        the job's cached pages (first_pass_completed), so its checks
+        and questions don't wait on the sites.
+        '''
+        options['plugin_path'] = self.interface_action_base_plugin.plugin_path
+        for (key, suffix) in (('first_pass_cachefile','.basic_cache'),
+                              ('first_pass_cookiejarfile','.cookiejar')):
+            tmp = PersistentTemporaryFile(suffix=suffix, dir=options['tdir'])
+            tmp.close()
+            options[key] = tmp.name
+        count = len([ x for x in book_list if x['good'] ])
+        job = self.gui.job_manager.run_job(
+                self.Dispatcher(partial(self.first_pass_completed, options=options)),
+                'arbitrary_n',
+                args=['calibre_plugins.fanficfare_plugin.jobs',
+                      'do_first_pass_worker',
+                      (book_list, options)],
+                description=_('Fetch metadata for %s FanFiction stories')%count)
+        job.orig_book_list = book_list
+        self.do_status_message(_('Fetching metadata for %s stories in the background.')%count, 3000)
+
+    def load_first_pass_file(self, load, filename):
+        ## missing or empty if the first pass job failed or had
+        ## nothing to fetch; then the foreground pass goes to the sites.
+        if filename and os.path.exists(filename) and os.path.getsize(filename):
+            try:
+                load(filename)
+            except Exception as e:
+                logger.warning("Failed to load background first pass file %s: %s"%(filename,e))
+
+    def first_pass_completed(self, job, options={}):
+        if job.failed:
+            self.gui.job_exception(job, dialog_title=_('Background Job Failed to Fetch Metadata'))
+            book_list = copy.deepcopy(job.orig_book_list)
+            for book in book_list:
+                book['first_pass_error'] = _('Background Job Failed, see Calibre Jobs log.')
+        else:
+            book_list = job.result
+        options['first_pass_done'] = True
+        self.prep_downloads(options, book_list)
 
     def reject_url(self,merge,book):
         url = book['url']
@@ -1350,7 +1407,16 @@ class FanFicFarePlugin(InterfaceAction):
             # book has already been flagged bad for whatever reason.
             return
 
-        adapter = get_fff_adapter(url,fileform,ini_snippet=options.get('ini_snippet',None))
+        if 'first_pass_error' in book:
+            ## the background first pass couldn't get it, don't
+            ## retry it here in the foreground.
+            raise exceptions.FailedToDownload(book['first_pass_error'])
+
+        ini_snippet = options.get('ini_snippet',None)
+        if options.get('first_pass_done'):
+            ## read the pages the background first pass fetched.
+            ini_snippet = first_pass_ini_snippet(ini_snippet)
+        adapter = get_fff_adapter(url,fileform,ini_snippet=ini_snippet)
         ## chapter range for title_chapter_range_pattern
         adapter.setChaptersRange(book['begin'],book['end'])
 
@@ -1360,10 +1426,14 @@ class FanFicFarePlugin(InterfaceAction):
             configuration.set_basic_cache(options['basic_cache'])
         else:
             options['basic_cache'] = configuration.get_basic_cache()
+            self.load_first_pass_file(options['basic_cache'].load_cache,
+                                      options.get('first_pass_cachefile'))
         if 'cookiejar' in options:
             configuration.set_cookiejar(options['cookiejar'])
         else:
             options['cookiejar'] = configuration.get_cookiejar()
+            self.load_first_pass_file(options['cookiejar'].load_cookiejar,
+                                      options.get('first_pass_cookiejarfile'))
 
         if collision in (CALIBREONLY, CALIBREONLYSAVECOL):
             ## Getting metadata from configured column.
